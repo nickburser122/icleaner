@@ -110,6 +110,8 @@ mark{background:var(--honey);color:var(--ink);border-radius:3px;padding:0 1px;bo
 .dd-chev svg{width:15px;height:15px}
 .dd-pop{position:absolute;top:calc(100% + 8px);left:0;min-width:230px;max-height:340px;overflow:auto;background:var(--sheet);border:1px solid var(--line);border-radius:13px;padding:6px;box-shadow:0 4px 10px -6px rgba(70,60,45,.18),0 26px 48px -24px rgba(70,60,45,.3);opacity:0;transform:translateY(-4px) scale(.99);transform-origin:top left;pointer-events:none;transition:opacity .16s,transform .16s;z-index:140}
 .dd.open .dd-pop{opacity:1;transform:none;pointer-events:auto}
+.dd.up .dd-pop{top:auto;bottom:calc(100% + 8px);transform-origin:bottom left;transform:translateY(4px) scale(.99)}
+.dd.up.open .dd-pop{transform:none}
 .dd-pop::-webkit-scrollbar{width:8px}
 .dd-pop::-webkit-scrollbar-thumb{background:#DDD7C9;border-radius:6px}
 .dd-opt{display:flex;align-items:center;gap:10px;width:100%;padding:8px 10px;border-radius:8px;border:0;background:none;cursor:pointer;font:500 13px/1.25 var(--f-sans);letter-spacing:.005em;color:var(--ink-soft);text-align:left;white-space:nowrap}
@@ -983,7 +985,14 @@ document.addEventListener('click',()=>closeAllDD());
 function makeDD(el,onPick,multi){
 const btn=el.querySelector('.dd-btn'),pop=el.querySelector('.dd-pop'),val=el.querySelector('.dd-val');
 const api={el,open:false,
-setOpen(v){api.open=v;el.classList.toggle('open',v);btn.setAttribute('aria-expanded',v?'true':'false')},
+setOpen(v){
+api.open=v;
+if(v){
+const r=btn.getBoundingClientRect(),need=pop.offsetHeight+8;
+el.classList.toggle('up',r.bottom+need>window.innerHeight&&r.top-need>0)
+}
+el.classList.toggle('open',v);btn.setAttribute('aria-expanded',v?'true':'false')
+},
 setVal(t){val.textContent=t},
 setItems(items){pop.innerHTML=items.map(it=>it.sep?'<div class="dd-sep"></div>':'<button type="button" class="dd-opt'+(it.sel?' sel':'')+'" data-v="'+esc(it.v)+'">'+IC.ck+'<span>'+esc(it.label)+'</span>'+(it.n!=null?'<em>'+nf(it.n)+'</em>':'')+'</button>').join('')}};
 btn.addEventListener('click',e=>{e.stopPropagation();const was=api.open;closeAllDD(api);api.setOpen(!was)});
