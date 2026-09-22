@@ -783,17 +783,23 @@ if(!best||score>best.score)best={d:c.d,label:c.label,score};
 return best||{d:'\t',label:'Tab',score:0};
 }
 function isolate(recs){
-if(!recs.length)return{start:0,end:-1,modal:0};
+if(!recs.length)return{runs:[],modal:0,headerIdx:-1};
 const counts=recs.map(r=>r.length);
 const M=modal(counts).value;
 const min=Math.max(2,Math.ceil(M*0.6));
-let best={start:0,end:-1,len:0},s=-1;
+const runs=[];let s=-1;
 for(let i=0;i<=recs.length;i++){
 const ok=i<recs.length&&counts[i]>=min;
-if(ok){if(s<0)s=i}
-else if(s>=0){const len=i-s;if(len>best.len)best={start:s,end:i-1,len};s=-1}
+if(ok){if(s<0)s=i}else if(s>=0){runs.push({start:s,end:i-1,len:i-s});s=-1}
 }
-return{start:best.start,end:best.end,modal:M};
+if(!runs.length)return{runs:[],modal:M,headerIdx:-1};
+const main=runs.reduce((a,b)=>b.len>a.len?b:a);
+const data=runs.filter(r=>r.len>=3||r===main);
+let headerIdx=-1;
+for(let i=data[0].start-1;i>=Math.max(0,data[0].start-5);i--){
+if(counts[i]===M){headerIdx=i;break}
+}
+return{runs:data,modal:M,headerIdx};
 }
 
 const RE_INT=/^-?\d{1,9}$/,RE_NUM=/^-?\d{1,15}(\.\d+)?$/,RE_DIG=/^\d+$/;
@@ -880,7 +886,7 @@ return Math.round(clamp(Math.max(base,label.length*8.4+34),92,340));
 }
 function buildSchema(block,hasHeader){
 const body=hasHeader?block.slice(1):block;
-const n=Math.max(...block.map(r=>r.length));
+const n=modal(block.map(r=>r.length)).value||Math.max(...block.map(r=>r.length),1);
 const cols=[];
 for(let c=0;c<n;c++){
 const vals=body.map(r=>r[c]||'');
@@ -926,6 +932,7 @@ return out;
 }
 const SEP='\u001f';
 function keyOf(cells,ki){
+if(!ki.length)return 'h'+fnv(cells.join(SEP));
 const parts=ki.map(i=>cells[i]||'');
 if(parts.some(p=>p===''))return null;
 return parts.join(SEP);
@@ -940,14 +947,18 @@ const IDX={dict:new Map(),sorted:[],sortedDirty:true,del:null,delCapped:false,ms
 function idxReset(){IDX.dict=new Map();IDX.sorted=[];IDX.sortedDirty=true;IDX.del=null;IDX.delCapped=false}
 function idxAdd(){
 const t0=performance.now();
-const sc=[];
-(App.ds?App.ds.columns:[]).forEach((c,i)=>{if(c.searchable)sc.push(i)});
+const sc=[],tc=new Set();
+(App.ds?App.ds.columns:[]).forEach((c,i)=>{if(c.searchable){sc.push(i);if(c.type==='text'||c.type==='longtext')tc.add(i)}});
 const d=IDX.dict;
 for(let ri=0;ri<App.rows.length;ri++){
 const cells=App.rows[ri].cells;
 for(const i of sc){
 const toks=tokenize(cells[i]);
 for(const t of toks){let s=d.get(t);if(!s){s=new Set();d.set(t,s)}s.add(ri)}
+if(tc.has(i))for(let k=0;k<toks.length-1;k++){
+const bg=toks[k]+toks[k+1];
+let s=d.get(bg);if(!s){s=new Set();d.set(bg,s)}s.add(ri);
+}
 }
 }
 IDX.sortedDirty=true;IDX.del=null;
@@ -1007,7 +1018,6 @@ if(s.size>bestN){bestN=s.size;best=c}
 if(!set.size&&best&&!suggest)suggest={from:t,to:best};
 }
 acc=acc===null?set:inter(acc,set);
-if(acc.size===0&&!suggest)acc=new Set();
 }
 lastSearch={toks,idx:acc,suggest,surfaces:[...new Set(surfaces)].slice(0,24)};
 return lastSearch;
@@ -1101,7 +1111,15 @@ const ci=colIdx(App.ui.sortKey),col=App.ds.columns[ci];
 const numeric=['int','number','date','duration'].includes(col.type);
 const dec=ids.map(i=>[sortVal(App.rows[i],ci,col),i]);
 dec.sort((a,b)=>{
-const c=numeric?(a[0]-b[0]):coll.compare(String(a[0]),String(b[0]));
+if(numeric){
+const ba=a[0]===-Infinity,bb=b[0]===-Infinity;
+if(ba&&bb)return a[1]-b[1];
+if(ba)return 1;
+if(bb)return -1;
+const c=a[0]===b[0]?0:(a[0]<b[0]?-1:1);
+return c!==0?c*App.ui.sortDir:a[1]-b[1];
+}
+const c=coll.compare(String(a[0]),String(b[0]));
 return c!==0?c*App.ui.sortDir:a[1]-b[1];
 });
 ids=dec.map(x=>x[1]);
@@ -1758,8 +1776,40 @@ const SAMPLE=['iClaim — Biologic claims · Branch report',
 ['737607','4 days','01000520376','عماد عبد اللطيف سعيد حسن','27906041800276','OTHER/Axial spondyloarthritis (Ax-SpA) +Uveitis','OTHER BIO/Humira 40 mg','3 Months','13/09/2026','فرع البحيرة','Approved','Download'],
 '© 2026 iClaim — all rights reserved'].map(x=>Array.isArray(x)?x.join('\t'):x).join('\n');
 
+const normLabel=s=>fold(String(s||'').trim()).replace(/\s+/g,' ');
+function targetKeyIdx(ds){return(ds.keyCols||[]).map(id=>ds.columns.findIndex(c=>c.id===id)).filter(i=>i>=0)}
+function matchProfile(text){
+for(const ds of App.datasets){
+const p=ds.profile;if(!p)continue;
+let recs;
+if(RV&&RV.text===text){RV.cache=RV.cache||{};recs=RV.cache[p.delim]||(RV.cache[p.delim]=splitRecords(text,p.delim))}
+else recs=splitRecords(text,p.delim);
+const target=p.labels.map(normLabel).join('\u0001');
+let hIdx=-1;
+for(let i=0;i<Math.min(recs.length,200);i++){
+if(recs[i].length!==p.labels.length)continue;
+if(recs[i].map(normLabel).join('\u0001')===target){hIdx=i;break}
+}
+if(hIdx<0)continue;
+const body=[],droppedLines=[];
+for(let i=0;i<recs.length;i++){
+if(i===hIdx)continue;
+if(i<hIdx){droppedLines.push(recs[i]);continue}
+if(recs[i].length===p.labels.length)body.push(recs[i]);else droppedLines.push(recs[i]);
+}
+const cols=ds.columns.map(c=>({...c}));
+const sink=ds.sink;
+const prepped=prepRows(body,cols,sink);
+const keyCols=targetKeyIdx(ds);
+return{empty:false,delim:p.delim,delimLabel:(DELIMS.find(d=>d.d===p.delim)||{label:p.delim}).label,block:[recs[hIdx]].concat(body),body,prepped,cols,sink,keyCols,hasHeader:true,dropped:droppedLines.length,droppedLines,total:recs.length,profileMatched:true,profileDsId:ds.id,profileName:ds.name};
+}
+return null;
+}
 let RV=null;
 function analyze(text,forcedDelim,forcedHeader){
+if(forcedDelim==null&&forcedHeader==null&&!(RV&&RV.ignoreProfile)){
+const pm=matchProfile(text);if(pm)return pm;
+}
 const sn=forcedDelim?DELIMS.find(d=>d.d===forcedDelim):sniff(text);
 let recs;
 if(RV&&RV.text===text){
@@ -1767,20 +1817,44 @@ RV.cache=RV.cache||{};
 recs=RV.cache[sn.d]||(RV.cache[sn.d]=splitRecords(text,sn.d));
 }else recs=splitRecords(text,sn.d);
 const iso=isolate(recs);
-if(iso.end<iso.start)return{empty:true,delim:sn.d,delimLabel:sn.label,recs,dropped:recs.length,droppedLines:recs};
-const block=recs.slice(iso.start,iso.end+1);
-const droppedLines=recs.slice(0,iso.start).concat(recs.slice(iso.end+1));
+if(!iso.runs.length)return{empty:true,delim:sn.d,delimLabel:sn.label,recs,dropped:recs.length,droppedLines:recs};
+const kept=new Set();
+if(iso.headerIdx>=0)kept.add(iso.headerIdx);
+for(const r of iso.runs)for(let i=r.start;i<=r.end;i++)kept.add(i);
+const dataRows=[];
+for(const r of iso.runs)for(let i=r.start;i<=r.end;i++)dataRows.push(recs[i]);
+const headerRow=iso.headerIdx>=0?recs[iso.headerIdx]:null;
+const block=headerRow?[headerRow].concat(dataRows):dataRows;
+const droppedLines=recs.filter((_,i)=>!kept.has(i));
 const hasHeader=forcedHeader==null?detectHeader(block):forcedHeader;
 const cols=buildSchema(block,hasHeader);
 const body=hasHeader?block.slice(1):block;
 const sink=sinkIndex(cols);
-const keyCols=pickKey(cols,body.filter(r=>r.length===cols.length));
-return{empty:false,delim:sn.d,delimLabel:(DELIMS.find(d=>d.d===sn.d)||sn).label,block,body,cols,sink,keyCols,hasHeader,dropped:recs.length-block.length,droppedLines,total:recs.length};
+const prepped=prepRows(body,cols,sink);
+const keyCols=pickKey(cols,prepped.map(p=>p.cells));
+return{empty:false,delim:sn.d,delimLabel:(DELIMS.find(d=>d.d===sn.d)||sn).label,block,body,prepped,cols,sink,keyCols,hasHeader,dropped:recs.length-kept.size,droppedLines,total:recs.length};
 }
-function diff(a){
-const cols=a.cols,ki=a.keyCols,sink=a.sink;
-const prepped=prepRows(a.body,cols,sink);
-const existing=RV.existingRows||new Map();
+function reconcileTarget(a,tgt){
+if(a.cols.length!==tgt.columns.length)return{ok:false,paste:a.cols.length,target:tgt.columns.length};
+let body=a.body.slice();
+const dropped=[];
+while(tgt.hasHeader&&body.length&&body[0].every((v,i)=>!tgt.columns[i]||normLabel(v)===normLabel(tgt.columns[i].label))){
+dropped.push(body[0]);
+body=body.slice(1);
+}
+if(dropped.length){a.droppedLines=(a.droppedLines||[]).concat(dropped);a.dropped=(a.dropped||0)+dropped.length}
+a.cols=tgt.columns.map(c=>({...c}));
+a.sink=tgt.sink;
+a.body=body;
+a.prepped=prepRows(body,a.cols,a.sink);
+a.keyCols=targetKeyIdx(tgt);
+a.hasHeader=true;
+return{ok:true};
+}
+function diff(a,existingArg){
+const cols=a.cols,ki=a.keyCols;
+const prepped=a.prepped||prepRows(a.body,cols,a.sink);
+const existing=existingArg||RV.existingRows||new Map();
 const res={new:[],unchanged:0,changed:[],quarantine:[],dupInPaste:0,merged:0,short:0,prepped};
 const byKey=new Map();
 for(const p of prepped){
@@ -1818,9 +1892,12 @@ function sigOf(cols){return cols.map(c=>c.label.toLowerCase()+':'+c.type).join('
 function openReview(text,presetTarget){
 const a=analyze(text,null,null);
 if(a.empty){toast('No table found in that paste','x');return}
-RV={text,forcedDelim:null,forcedHeader:null,targetId:null,existingRows:new Map(),a,detail:null,name:''};
+RV={text,forcedDelim:null,forcedHeader:null,targetId:null,existingRows:new Map(),a,detail:null,name:'',overrides:null,ignoreProfile:false};
+let match=a.profileMatched?App.datasets.find(d=>d.id===a.profileDsId):null;
+if(!match){
 const sig=sigOf(a.cols);
-const match=App.datasets.find(d=>sigOf(d.columns)===sig)||(presetTarget?App.datasets.find(d=>d.id===presetTarget):null);
+match=App.datasets.find(d=>sigOf(d.columns)===sig)||(presetTarget?App.datasets.find(d=>d.id===presetTarget):null);
+}
 RV.targetId=match?match.id:null;
 rvEl.name.value=match?match.name:suggestName(a);
 loadTarget().then(()=>{recomputeRV();openModal('review')});
@@ -1832,15 +1909,30 @@ return 'Dataset '+(App.datasets.length+1);
 function recomputeRV(){
 const a=analyze(RV.text,RV.forcedDelim,RV.forcedHeader);
 if(a.empty){rvEl.sum.textContent='No table found with this delimiter.';rvEl.go.disabled=true;return}
-if(RV.a&&RV.overrides&&sigOf(a.cols)===RV.sigBase)applyOverrides(a);
-else{RV.overrides=null;RV.sigBase=sigOf(a.cols)}
-RV.a=a;
-const d=diff(a);
-RV.d=d;
-rvEl.go.disabled=!(d.new.length||d.changed.length);
 const tgt=RV.targetId?App.datasets.find(x=>x.id===RV.targetId):null;
+if(tgt){
+const rec=reconcileTarget(a,tgt);
+if(!rec.ok){
+RV.a=a;RV.d=null;
+rvEl.sum.textContent='This paste has '+rec.paste+' columns but “'+tgt.name+'” has '+rec.target+'. Import blocked to avoid corrupting the dataset — switch to “New dataset” or check the delimiter.';
+rvEl.go.disabled=true;
+rvEl.warn.hidden=true;rvEl.key.innerHTML='';rvEl.cols.innerHTML='';rvEl.prev.innerHTML='';rvEl.stats.innerHTML='';rvEl.detail.innerHTML='';
+ddDelim.setItems(DELIMS.map(x=>({v:x.d,label:x.label,sel:x.d===a.delim})));
+ddDelim.setVal(a.delimLabel);
+return;
+}
+}else if(RV.overrides&&RV.overrides.n===a.cols.length){
+applyOverrides(a);
+}else{
+RV.overrides=null;
+}
+RV.a=a;
+const d=diff(a,RV.existingRows);
+RV.d=d;
+rvEl.go.disabled=!(d.new.length||d.changed.length||d.quarantine.length);
 let sumH=nf(a.body.length)+' data rows · '+a.cols.length+' columns · delimiter '+esc(a.delimLabel.toLowerCase())+' · header '+(a.hasHeader?'detected':'not used');
 if(a.dropped)sumH+=' · <button type="button" class="linkbtn" data-act="dropped">'+a.dropped+' non-table line'+(a.dropped>1?'s':'')+' discarded</button>';
+if(a.profileMatched)sumH='<b>Recognised:</b> '+esc(a.profileName)+' — matched saved profile · <button type="button" class="linkbtn" data-act="reprofile">Re-detect</button><br>'+sumH;
 rvEl.sum.innerHTML=sumH;
 ddDelim.setItems(DELIMS.map(x=>({v:x.d,label:x.label,sel:x.d===a.delim})));
 ddDelim.setVal(a.delimLabel);
@@ -1870,10 +1962,11 @@ const ov=o.cols[i];
 if(!ov)return;
 c.label=ov.label;
 if(ov.type!==c.type){c.type=ov.type;c.enumValues=ov.type==='enum'?[...new Set(a.body.map(r=>r[i]||'').filter(Boolean))].slice(0,40):null}
+if(ov.type==='date')c.dayFirst=!!ov.dayFirst;
 });
 a.keyCols=o.keyCols.filter(i=>i<a.cols.length);
 }
-function snapOverrides(a){RV.overrides={cols:a.cols.map(c=>({label:c.label,type:c.type})),keyCols:a.keyCols.slice()}}
+function snapOverrides(a){RV.overrides={n:a.cols.length,cols:a.cols.map(c=>({label:c.label,type:c.type,dayFirst:!!c.dayFirst})),keyCols:a.keyCols.slice()}}
 function renderRVCols(a){
 const body=a.body;
 rvEl.cols.innerHTML=a.cols.map((c,i)=>{
@@ -1884,6 +1977,7 @@ const isKey=a.keyCols.includes(i);
 const uniqOk=uniq===body.length&&nonEmpty===body.length;
 return '<div class="ccard'+(isKey?' iskey':'')+'"><input class="clab" data-ci="'+i+'" value="'+esc(c.label)+'">'+
 '<select data-ct="'+i+'">'+TYPES.map(t=>'<option value="'+t+'"'+(t===c.type?' selected':'')+'>'+TYPE_LABEL[t]+'</option>').join('')+'</select>'+
+(c.type==='date'?'<select data-cdf="'+i+'"><option value="1"'+(c.dayFirst?' selected':'')+'>Day first (31/01)</option><option value="0"'+(!c.dayFirst?' selected':'')+'>Month first (01/31)</option></select>':'')+
 '<div class="krow"><label><input type="checkbox" data-ck="'+i+'"'+(isKey?' checked':'')+'>Key</label><span class="uniq"'+(uniqOk?' style="color:var(--p-sage-c)"':'')+'>'+nf(uniq)+'/'+nf(body.length)+'</span></div></div>';
 }).join('');
 }
@@ -1937,9 +2031,10 @@ RV.detail=RV.detail===b.dataset.s?null:b.dataset.s;
 renderRVStats(RV.d);
 });
 rvEl.sum.addEventListener('click',e=>{
-const lb=e.target.closest('[data-act="dropped"]');if(!lb)return;
-RV.detail=RV.detail==='dropped'?null:'dropped';
-renderRVStats(RV.d);
+const dl=e.target.closest('[data-act="dropped"]');
+if(dl){RV.detail=RV.detail==='dropped'?null:'dropped';renderRVStats(RV.d);return}
+const rp=e.target.closest('[data-act="reprofile"]');
+if(rp){RV.ignoreProfile=true;recomputeRV();return}
 });
 rvEl.cols.addEventListener('change',e=>{
 const t=e.target;
@@ -1948,6 +2043,11 @@ const i=+t.dataset.ct,c=RV.a.cols[i];
 c.type=t.value;
 c.enumValues=t.value==='enum'?[...new Set(RV.a.body.map(r=>r[i]||'').filter(Boolean))].slice(0,40):null;
 c.width=widthFor(c.type,c.median,c.label);
+snapOverrides(RV.a);recomputeRV();
+}
+if(t.dataset.cdf!=null){
+const i=+t.dataset.cdf,c=RV.a.cols[i];
+c.dayFirst=t.value==='1';
 snapOverrides(RV.a);recomputeRV();
 }
 if(t.dataset.ck!=null){
@@ -1963,7 +2063,7 @@ if(e.target.dataset.ci==null)return;
 RV.a.cols[+e.target.dataset.ci].label=e.target.value.trim()||('Column '+(+e.target.dataset.ci+1));
 snapOverrides(RV.a);
 });
-rvEl.header.addEventListener('change',()=>{RV.forcedHeader=rvEl.header.checked;RV.overrides=null;recomputeRV()});
+rvEl.header.addEventListener('change',()=>{RV.forcedHeader=rvEl.header.checked;recomputeRV()});
 $('rvCancel').addEventListener('click',()=>closeModal('review'));
 $('rvClose').addEventListener('click',()=>closeModal('review'));
 rvEl.go.addEventListener('click',commitImport);
@@ -1980,25 +2080,34 @@ ds={id:uid(),name:(rvEl.name.value||'').trim()||suggestName(a),createdAt:now,upd
 delimiter:a.delim,hasHeader:a.hasHeader,
 columns:a.cols.map(c=>({id:c.id,label:c.label,type:c.type,dayFirst:!!c.dayFirst,enumValues:c.enumValues,median:c.median,width:c.width,visible:true,searchable:true})),
 keyCols:a.keyCols.map(i=>a.cols[i].id),sink:a.sink,rowCount:0,quarantine:[]};
+ds.profile={delim:ds.delimiter,labels:ds.columns.map(c=>c.label)};
 }else{
 ds.updatedAt=now;
 if(!ds.quarantine)ds.quarantine=[];
 }
+const qLen=(ds.quarantine||[]).length;
 const toWrite=[];
 for(const r of d.new)toWrite.push({dsId:ds.id,key:r.key,cells:r.cells,hash:hashOf(r.cells,a.keyCols),addedAt:now,updatedAt:now,flags:r.flags});
 for(const r of d.changed)toWrite.push({dsId:ds.id,key:r.key,cells:r.cells,hash:r.hash,addedAt:(RV.existingRows.get(r.key)||{}).addedAt||now,updatedAt:now,flags:r.flags,prev:r.prev});
-const undo={dsId:ds.id,created:fresh,added:d.new.map(r=>r.key),restored:d.changed.map(r=>{const o=RV.existingRows.get(r.key);return{dsId:ds.id,key:r.key,cells:o.cells,hash:o.hash,addedAt:o.addedAt,updatedAt:o.updatedAt,flags:o.flags||[],prev:o.prev}})};
-if(d.quarantine.length)ds.quarantine=ds.quarantine.concat(d.quarantine.map(q=>({cells:q.cells,reason:q.reason,at:now})));
-ds.rowCount=(RV.existingRows.size||0)+d.new.length;
+const undo={dsId:ds.id,created:fresh,qLen,added:d.new.map(r=>r.key),restored:d.changed.map(r=>{const o=RV.existingRows.get(r.key);return{dsId:ds.id,key:r.key,cells:o.cells,hash:o.hash,addedAt:o.addedAt,updatedAt:o.updatedAt,flags:o.flags||[],prev:o.prev}})};
+const newQuarantine=d.quarantine.length?(ds.quarantine||[]).concat(d.quarantine.map(q=>({cells:q.cells,reason:q.reason,at:now}))):ds.quarantine;
+const newRowCount=(RV.existingRows.size||0)+d.new.length;
 try{
 await dbPutRows(toWrite,(done,total)=>{rvEl.prog.textContent='Writing '+nf(done)+' / '+nf(total)+'…'});
+ds.quarantine=newQuarantine;
+ds.rowCount=newRowCount;
 await dbPut('datasets',ds);
 if(fresh)App.datasets.push(ds);
 await savePref('lastDs',ds.id);
 if(navigator.storage&&navigator.storage.persist)navigator.storage.persist().catch(()=>{});
 }catch(err){
 DBOK=false;
-toast('Could not save to storage — data is in memory only','x');
+rvEl.prog.textContent='';
+rvEl.go.disabled=false;
+rvEl.warn.hidden=false;
+rvEl.warn.innerHTML='Could not save — storage may be full or unavailable. Nothing was imported; try again, or export what you need first.';
+toast('Import failed — nothing was saved','x');
+return;
 }
 App.undo=undo;
 closeModal('review');
@@ -2011,7 +2120,7 @@ if(d.new.length)bits.push(nf(d.new.length)+' new');
 if(d.changed.length)bits.push(nf(d.changed.length)+' changed');
 if(d.unchanged)bits.push(nf(d.unchanged)+' unchanged');
 if(d.quarantine.length)bits.push(nf(d.quarantine.length)+' quarantined');
-toast(ds.name+' · '+bits.join(', '),'check');
+toast(ds.name+' · '+(bits.join(', ')||'nothing to import'),'check');
 rvEl.prog.textContent='';
 $('btnUndo').hidden=false;
 }
@@ -2024,7 +2133,7 @@ toast('Import undone','undo');return}
 await dbDelRows(u.dsId,u.added);
 if(u.restored.length)await dbPutRows(u.restored);
 const ds=App.datasets.find(d=>d.id===u.dsId);
-if(ds){ds.rowCount=Math.max(0,ds.rowCount-u.added.length);await dbPut('datasets',ds).catch(()=>{})}
+if(ds){ds.rowCount=Math.max(0,ds.rowCount-u.added.length);if(typeof u.qLen==='number')ds.quarantine=(ds.quarantine||[]).slice(0,u.qLen);await dbPut('datasets',ds).catch(()=>{})}
 App.undo=null;$('btnUndo').hidden=true;
 await openDataset(u.dsId);
 toast('Import undone — '+nf(u.added.length)+' rows removed','undo');
@@ -2233,7 +2342,149 @@ $('swFuzzy').addEventListener('change',e=>{if(!App.ui){e.target.checked=!e.targe
 
 detectA();
 
+function selftestFixtures(){
+const header=['Claim ID','Waiting','Phone','Patient','National ID','Diagnosis','Drug','Duration','Submitted','Hospital','Status','Action'];
+const rows=[
+['333380','16 days','01002385547','Nermin Abdelhamid Marei','27606101802083','Rheumatoid Arthritis (RA)','Golimumab','3 Months','23/04/2023','Beheira Branch','Approved','Download'],
+['601047','388 days','01069769898','Sanaa Mohamed Abdelmoneim Abdelhamid Shalash','26104271800281','Osteoporosis','denosumab 60mg','1 Cycles','27/08/2025','Beheira Branch','Pending','Correction'],
+['651523','27 days','01027788391','Mazen Gaber Ibrahim','31909051804631','OTHER/Agammaglobulinemia+Parapneumonic empyema','OTHER BIO/IVIG','3 Months','13/01/2026','Beheira Branch','Follow ST Protocol','Download'],
+['726103','32 days','01148152005','Yousef Ghanem Mohamed Bassiouni','32109241802098','Atopic dermatitis (AD)','Baricitinib','3 Months','11/08/2026','Beheira Branch','Approved','Download'],
+['728791','33 days','01099808380','Esmat Bayoumi Mohamed','26805251801882','Osteoporosis','Bio* Denosumab 60mg','1 Cycles','17/08/2026','Beheira Branch','Pending','Correction'],
+['728794','33 days','01006676426','Karima Sayed Ahmed Soliman','31602011803545','Chronic immune thrombocytopenia (ITP)','Romiplostim','3 Months','17/08/2026','Beheira Branch','Approved','Download'],
+['730238','24 days','01222422741','Siham Abdelfattah Darbala','28103201802007','OTHER/SEVER PSORIASIS','OTHER BIO/Stelara 90 mg','2 Cycles','22/08/2026','Beheira Branch','Approved','Download'],
+['730338','25 days','01210215648','Maya Emad Rizk','31504111802803','Haemophilia','Factor 8','2 Cycles','25/08/2026','Beheira Branch','Pending','Correction'],
+['734605','13 days','01064962000','Sahar Mahmoud Aly Shalash','26805211800468','Rheumatoid Arthritis (RA)','Bio*Rituximab 500mg','6 Cycles','03/09/2026','Beheira Branch','Approved','Download'],
+['737323','6 days','01286453217','Yazan Ibrahim Ramadan Ibrahim','32505239798210','Haemophilia','Factor 7','2 Cycles','13/09/2026','Beheira Branch','Pending','Correction'],
+['735970','9 days','0128953876','Mohamed Said Abdelmagid Ramadan','25609201800233','Ankylosing Spondylitis (AS)','Golimumab','3 Months','08/09/2026','Beheira Branch','Approved','Download'],
+['737607','4 days','01000520376','Emad Abdellatif Said Hassan','27906041800276','OTHER/Axial spondyloarthritis (Ax-SpA) +Uveitis','OTHER BIO/Humira 40 mg','3 Months','13/09/2026','Beheira Branch','Approved','Download']
+];
+return{header,rows};
+}
+function runSelftest(){
+const results=[];
+const check=(name,cond,detail)=>results.push({name,pass:!!cond,detail:detail||''});
+App.datasets=[];
+const fx=selftestFixtures();
+const withChrome=[fx.header.join('\t'),'Search claims…',...fx.rows.map(r=>r.join('\t'))].join('\n');
+const noChrome=[fx.header.join('\t'),...fx.rows.map(r=>r.join('\t'))].join('\n');
+const comma=[fx.header.join(','),...fx.rows.map(r=>r.join(','))].join('\n');
+const ws=[fx.header.join('   '),...fx.rows.map(r=>r.join('   '))].join('\n');
+
+RV={text:withChrome,ignoreProfile:false};
+let a=analyze(withChrome,null,null);
+check('Header recovered across an interleaved chrome line',
+!a.empty&&a.cols.length===12&&a.cols.every((c,i)=>c.label===fx.header[i])&&a.hasHeader===true&&a.body.length===fx.rows.length,
+'cols='+(a.cols||[]).length+' hasHeader='+a.hasHeader+' rows='+(a.body||[]).length);
+let d=diff(a,new Map());
+check('Zero quarantine/merged/short on the recovered header case',
+d.quarantine.length===0&&d.merged===0&&d.short===0,
+'quarantine='+d.quarantine.length+' merged='+d.merged+' short='+d.short);
+check('Key column resolved to Claim ID',
+a.keyCols.length===1&&a.cols[a.keyCols[0]].label==='Claim ID',
+'keyCols='+JSON.stringify(a.keyCols.map(i=>a.cols[i]&&a.cols[i].label)));
+check('Dropped-line count is exactly the one chrome line',a.dropped===1,'dropped='+a.dropped);
+
+RV={text:noChrome,ignoreProfile:false};
+let a2=analyze(noChrome,null,null);
+check('Same result with the chrome line removed',
+!a2.empty&&a2.cols.length===a.cols.length&&a2.cols.every((c,i)=>c.label===a.cols[i].label)&&a2.hasHeader===a.hasHeader&&a2.body.length===a.body.length,
+'cols='+(a2.cols||[]).length+' hasHeader='+a2.hasHeader+' rows='+(a2.body||[]).length);
+
+const existing=new Map();
+for(const r of d.new)existing.set(r.key,{cells:r.cells,hash:hashOf(r.cells,a.keyCols),addedAt:0,updatedAt:0,flags:r.flags});
+RV={text:withChrome,ignoreProfile:false};
+const a3=analyze(withChrome,null,null);
+const d2=diff(a3,existing);
+check('Re-importing the same paste yields new:0 changed:0',
+d2.new.length===0&&d2.changed.length===0&&d2.unchanged===fx.rows.length,
+'new='+d2.new.length+' changed='+d2.changed.length+' unchanged='+d2.unchanged);
+
+const editedRows=fx.rows.map((r,i)=>i>=fx.rows.length-5?r.map((v,ci)=>ci===10?v+' *':v):r.slice());
+const editedText=[fx.header.join('\t'),...editedRows.map(r=>r.join('\t'))].join('\n');
+RV={text:editedText,ignoreProfile:false};
+const a4=analyze(editedText,null,null);
+const d3=diff(a4,existing);
+check('Editing the last 5 rows yields exactly 5 changed',
+d3.changed.length===5&&d3.new.length===0,
+'changed='+d3.changed.length+' new='+d3.new.length);
+
+const klRows=[['a','x'],['a','y'],['a','z'],['b','y'],['b','x']];
+const klText=klRows.map(r=>r.join('\t')).join('\n');
+RV={text:klText,ignoreProfile:false};
+const a5=analyze(klText,null,null);
+const d4=diff(a5,new Map());
+check('A keyless paste imports every row, not one',
+a5.keyCols.length===0&&d4.new.length===klRows.length,
+'keyCols='+a5.keyCols.length+' new='+d4.new.length+' of '+klRows.length);
+
+RV={text:comma,ignoreProfile:false};
+const a6=analyze(comma,null,null);
+check('Comma-delimited fixture detected correctly',
+!a6.empty&&a6.delim===','&&a6.cols.length===12&&a6.hasHeader===true,
+'delim='+JSON.stringify(a6.delim)+' cols='+(a6.cols||[]).length+' hasHeader='+a6.hasHeader);
+
+RV={text:ws,ignoreProfile:false};
+const a7=analyze(ws,null,null);
+check('2+ spaces fixture detected correctly',
+!a7.empty&&a7.cols.length===12&&a7.hasHeader===true,
+'delim='+JSON.stringify(a7.delim)+' cols='+(a7.cols||[]).length+' hasHeader='+a7.hasHeader);
+
+const overWideBlock=[['a1','b1','c1'],['a2','b2','c2'],['a3','b3','c3','stray']];
+check('buildSchema uses modal width, not max, against a stray wide row',
+buildSchema(overWideBlock,false).length===3);
+
+const tgtCols=[
+{id:'c0',label:'Claim ID',type:'int',dayFirst:false,enumValues:null},
+{id:'c1',label:'Waiting',type:'duration',dayFirst:false,enumValues:null},
+{id:'c2',label:'Patient',type:'text',dayFirst:false,enumValues:null}
+];
+const tgt={id:'ds1',name:'Test DS',columns:tgtCols,keyCols:['c0'],sink:2,hasHeader:true,delimiter:'\t',profile:{delim:'\t',labels:tgtCols.map(c=>c.label)}};
+App.datasets=[tgt];
+
+const mismatchText=['Claim ID\tWaiting\tPatient\tExtra','1\t2 days\tX\tY'].join('\n');
+RV={text:mismatchText,ignoreProfile:true};
+const am=analyze(mismatchText,null,null);
+const rec=reconcileTarget(am,tgt);
+check('Width mismatch against a target dataset is blocked',
+rec.ok===false&&rec.paste===4&&rec.target===3,JSON.stringify(rec));
+
+const appendRepeat=['Claim ID\tWaiting\tPatient','Claim ID\tWaiting\tPatient','9\t1 day\tZ'].join('\n');
+RV={text:appendRepeat,ignoreProfile:true};
+const aAppend=analyze(appendRepeat,null,null);
+const recAppend=reconcileTarget(aAppend,tgt);
+check('Repeated header row(s) on append are dropped, not imported as data',
+recAppend.ok===true&&aAppend.body.length===1&&aAppend.body[0][0]==='9',
+'bodyLen='+(aAppend.body||[]).length);
+
+const appendNormal=['Claim ID\tWaiting\tPatient','9\t1 day\tZ','11\t3 days\tQ','13\t5 days\tW'].join('\n');
+RV={text:appendNormal,ignoreProfile:true};
+const aNorm=analyze(appendNormal,null,null);
+const recNorm=reconcileTarget(aNorm,tgt);
+check('Normal single-header append keeps all real data rows',
+recNorm.ok===true&&aNorm.body.length===3&&aNorm.body[0][0]==='9',
+'bodyLen='+(aNorm.body||[]).length);
+
+const profileText=['noise line before','Claim ID\tWaiting\tPatient','chrome in the middle','9\t1 day\tZ','11\t3 days\tQ'].join('\n');
+RV={text:profileText,ignoreProfile:false};
+const aProfile=analyze(profileText,null,null);
+check('A saved profile is recognised among unrelated chrome lines',
+aProfile.profileMatched===true&&aProfile.profileDsId==='ds1'&&aProfile.body.length===2&&aProfile.cols.length===3,
+'profileMatched='+aProfile.profileMatched+' bodyLen='+(aProfile.body||[]).length);
+
+App.datasets=[];RV=null;
+return results;
+}
+function renderSelftest(){
+const results=runSelftest();
+const fails=results.filter(r=>!r.pass).length;
+document.body.innerHTML='<div style="max-width:760px;margin:40px auto;padding:0 20px;font:14px/1.6 var(--f-mono,monospace);color:var(--ink,#222)">'+
+'<h1 style="font:600 20px var(--f-ui,sans-serif);margin-bottom:4px">Self-test — '+(fails?('<span style="color:#b3432b">'+fails+' failing</span>'):'<span style="color:#3f7d5c">all passing</span>')+'</h1>'+
+'<p style="color:var(--ink-soft,#666);margin-bottom:18px">'+results.length+' checks. Fixtures reshape the app\'s own sample data to reproduce the reported failure pattern (a chrome line between header and data) rather than a literal external paste.</p>'+
+results.map(r=>'<div style="padding:8px 0;border-top:1px solid var(--line,#ddd)"><span style="display:inline-block;width:52px;font-weight:600;color:'+(r.pass?'#3f7d5c':'#b3432b')+'">'+(r.pass?'PASS':'FAIL')+'</span>'+esc(r.name)+(r.pass?'':'<div style="margin-left:52px;color:var(--ink-faint,#999)">'+esc(r.detail)+'</div>')+'</div>').join('')+
+'</div>';
+}
 (async function boot(){
+if(/[?&]selftest=1\b/.test(location.search)){renderSelftest();return}
 try{
 App.datasets=await dbAll('datasets');
 App.datasets.sort((a,b)=>a.createdAt-b.createdAt);
