@@ -426,7 +426,6 @@ body.drawer-open .drawer{transform:none}
 .dd.open .dd-pop{transform:none}
 .dd-pop::before{display:none}
 .dd-opt{padding:8px 10px;font-size:13px}
-body.dd-sheet-open,body.dd-sheet-open .scrim{overflow:visible;opacity:0!important;pointer-events:none!important}
 #tbl{display:table}
 #cardList{display:none}
 .tablefoot{padding:12px 4px 0}
@@ -1248,20 +1247,27 @@ function makeDD(el,onPick,multi){
 const btn=el.querySelector('.dd-btn'),pop=el.querySelector('.dd-pop'),val=el.querySelector('.dd-val');
 const api={el,open:false,
 setOpen(v){
-api.open=v;el.classList.toggle('open',v);pop.classList.toggle('open',v);
+api.open=v;
+clearTimeout(api.homeT);
+if(v&&MOBILE&&pop.parentNode!==document.body){document.body.appendChild(pop);void pop.offsetWidth}
+if(v&&!MOBILE&&pop.parentNode===document.body)el.appendChild(pop);
+el.classList.toggle('open',v);pop.classList.toggle('open',v);
 btn.setAttribute('aria-expanded',v?'true':'false');
-if(v&&MOBILE){if(pop.parentNode!==document.body)document.body.appendChild(pop)}
-else if(pop.parentNode===document.body)el.appendChild(pop);
-document.body.classList.toggle('dd-sheet-open',ddReg.some(d=>d.open))
+if(!v&&pop.parentNode===document.body){
+if(MOBILE)api.homeT=setTimeout(()=>{if(!api.open&&pop.parentNode===document.body)el.appendChild(pop)},320);
+else el.appendChild(pop);
+}
+document.body.classList.toggle('dd-sheet-open',MOBILE&&ddReg.some(d=>d.open));
 },
 setVal(t){if(val)val.textContent=t},
 setItems(items){pop.innerHTML=items.map(it=>it.sep?'<div class="dd-sep"></div>':'<button type="button" class="dd-opt'+(it.sel?' sel':'')+'" data-v="'+esc(it.v)+'">'+IC.ck+'<span>'+esc(it.label)+'</span>'+(it.n!=null?'<em>'+nf(it.n)+'</em>':'')+'</button>').join('')}};
+btn.setAttribute('aria-haspopup','listbox');btn.setAttribute('aria-expanded','false');
 btn.addEventListener('click',e=>{e.stopPropagation();const was=api.open;closeAllDD(api);api.setOpen(!was)});
 pop.addEventListener('click',e=>{
 e.stopPropagation();
 const o=e.target.closest('.dd-opt');if(!o)return;
-onPick(o.dataset.v);
 if(!multi)api.setOpen(false);
+onPick(o.dataset.v);
 });
 ddReg.push(api);
 return api;
@@ -1611,7 +1617,7 @@ const legacy=()=>{
 const ta=document.createElement('textarea');
 ta.value=text;ta.style.cssText='position:fixed;opacity:0';
 document.body.appendChild(ta);ta.select();
-try{document.execCommand('copy');done()}catch(e){toast('Copy failed — select and copy manually','x')}
+try{if(document.execCommand('copy'))done();else throw 0}catch(e){toast('Copy failed — select and copy manually','x')}
 ta.remove();
 };
 if(navigator.clipboard&&navigator.clipboard.writeText)navigator.clipboard.writeText(text).then(done).catch(legacy);
@@ -1727,9 +1733,9 @@ saveUI();renderAll();
 document.addEventListener('keydown',e=>{
 const tag=(e.target.tagName||'').toLowerCase();
 const typing=tag==='input'||tag==='textarea'||e.target.isContentEditable;
-if(e.key==='/'&&!typing&&App.ds&&!MOBILE){e.preventDefault();qInput.focus();qInput.select();return}
+if(e.key==='/'&&!typing&&App.ds&&!MOBILE&&!document.querySelector('.modal.on')&&!document.body.classList.contains('drawer-open')){e.preventDefault();qInput.focus();qInput.select();return}
 if(e.key==='Escape'){
-if(ddReg.some(d=>d.open)){closeAllDD();return}
+if(ddReg.some(d=>d.open)){const o=ddReg.find(d=>d.open);closeAllDD();const b=o&&o.el.querySelector('.dd-btn');if(b&&b.isConnected)b.focus({preventScroll:true});return}
 if(document.querySelector('.modal.on')){closeModals();return}
 if(document.body.classList.contains('drawer-open')){closeDrawer();return}
 if(qInput.value)clearQ();
@@ -1889,7 +1895,7 @@ const rows=RV.targetId===(App.ds&&App.ds.id)?App.rows:await dbRowsOf(RV.targetId
 RV.existingRows=new Map(rows.map(r=>[r.key,r]));
 }
 function sigOf(cols){return cols.map(c=>c.label.toLowerCase()+':'+c.type).join('|')}
-function openReview(text,presetTarget){
+function openReview(text,presetTarget,forceNew){
 const a=analyze(text,null,null);
 if(a.empty){toast('No table found in that paste','x');return}
 RV={text,forcedDelim:null,forcedHeader:null,targetId:null,existingRows:new Map(),a,detail:null,name:'',overrides:null,ignoreProfile:false};
@@ -1898,8 +1904,8 @@ if(!match){
 const sig=sigOf(a.cols);
 match=App.datasets.find(d=>sigOf(d.columns)===sig)||(presetTarget?App.datasets.find(d=>d.id===presetTarget):null);
 }
-RV.targetId=match?match.id:null;
-rvEl.name.value=match?match.name:suggestName(a);
+RV.targetId=(!forceNew&&match)?match.id:null;
+rvEl.name.value=(!forceNew&&match)?match.name:suggestName(a);
 loadTarget().then(()=>{recomputeRV();openModal('review')});
 }
 function suggestName(a){
@@ -2179,7 +2185,7 @@ ddDataset.setItems(items);
 ddDataset.setVal(App.ds?App.ds.name:'—');
 }
 const ddDataset=makeDD($('ddDataset'),v=>{
-if(v==='__new'){openPaste();return}
+if(v==='__new'){openPaste();pasteIntoNew=true;return}
 if(App.ds&&v===App.ds.id)return;
 openDataset(v);
 });
@@ -2236,12 +2242,13 @@ mReview.disabled=n<2;
 }
 let dM=null;
 mTa.addEventListener('input',()=>{clearTimeout(dM);dM=setTimeout(detectM,120)});
-function openPaste(){closeDrawer();openModal('pasteModal');mTa.value='';detectM();setTimeout(()=>mTa.focus(),80)}
+let pasteIntoNew=false;
+function openPaste(){pasteIntoNew=false;closeDrawer();openModal('pasteModal');mTa.value='';detectM();setTimeout(()=>mTa.focus(),80)}
 $('btnPasteMore').addEventListener('click',openPaste);
 $('dMore').addEventListener('click',openPaste);
 $('mClose').addEventListener('click',()=>closeModal('pasteModal'));
 $('mCancel').addEventListener('click',()=>closeModal('pasteModal'));
-mReview.addEventListener('click',()=>openReview(mTa.value,App.ds?App.ds.id:null));
+mReview.addEventListener('click',()=>openReview(mTa.value,(App.ds&&!pasteIntoNew)?App.ds.id:null,pasteIntoNew));
 mSheet.addEventListener('dragover',e=>{e.preventDefault();e.stopPropagation();mSheet.classList.add('drag')});
 mSheet.addEventListener('dragleave',()=>mSheet.classList.remove('drag'));
 mSheet.addEventListener('drop',e=>{
@@ -2471,6 +2478,10 @@ check('A saved profile is recognised among unrelated chrome lines',
 aProfile.profileMatched===true&&aProfile.profileDsId==='ds1'&&aProfile.body.length===2&&aProfile.cols.length===3,
 'profileMatched='+aProfile.profileMatched+' bodyLen='+(aProfile.body||[]).length);
 
+document.body.classList.add('dd-sheet-open');
+const bcs=getComputedStyle(document.body);
+check('Opening a dropdown never hides or disables the page',bcs.opacity==='1'&&bcs.pointerEvents!=='none','opacity='+bcs.opacity+' pe='+bcs.pointerEvents);
+document.body.classList.remove('dd-sheet-open');
 App.datasets=[];RV=null;
 return results;
 }
